@@ -1,29 +1,40 @@
-package org.jd.gui.util.nexus.ui;
+package org.jd.gui.util.maven.central.helper;
 
+import org.jd.gui.api.API;
+import org.jd.gui.util.NexusConfigHelper;
+import org.jd.gui.util.ProxyConfigHelper;
+import org.jd.gui.util.maven.central.helper.model.response.docs.Docs;
+import org.jd.gui.util.nexus.NexusConfig;
 import org.jd.gui.util.nexus.NexusSearch;
+import org.jd.gui.util.nexus.NexusSearchFactory;
 import org.jd.gui.util.nexus.model.NexusArtifact;
 import org.jd.gui.util.nexus.model.NexusSearchResult;
+import org.jd.gui.util.maven.central.helper.model.response.Response;
+import org.jd.gui.util.maven.central.helper.model.ResponseRoot;
+import org.jd.gui.util.maven.central.helper.ProxyConfig;
+import org.jdesktop.swingx.JXTable;
+import org.jdesktop.swingx.decorator.HighlighterFactory;
+import org.oxbow.swingbits.list.CheckListRenderer;
+import org.oxbow.swingbits.table.filter.TableRowFilterSupport;
+import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
+import org.fife.ui.rtextarea.RTextScrollPane;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
-import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
-import javax.swing.JSpinner;
 import javax.swing.JTabbedPane;
-import javax.swing.JTable;
 import javax.swing.JTextField;
 import javax.swing.ProgressMonitor;
-import javax.swing.SpinnerNumberModel;
-import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
+import javax.swing.event.ListSelectionEvent;
+import javax.swing.event.ListSelectionListener;
 import javax.swing.table.AbstractTableModel;
 import java.awt.BorderLayout;
-import java.awt.Component;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
@@ -32,7 +43,6 @@ import java.beans.PropertyChangeListener;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Objects;
 
 /**
  * We provide a search panel for NexusSearch implementations.
@@ -45,11 +55,16 @@ import java.util.Objects;
  *
  * We execute searches in a background SwingWorker and report progress
  * through a ProgressMonitor and a progress bar. Results are displayed
- * in a table backed by a custom table model.
+ * in a table backed by a custom table model. Snippets for several build
+ * tools are shown for the selected row in RSyntaxTextArea tabs.
  */
 public final class NexusSearchPanel extends JPanel {
 
-    private final NexusSearch search;
+    private static final long serialVersionUID = 1L;
+
+    private static final int MAX_PAGES = 50;
+
+    private final transient NexusSearch search;
 
     private final JTabbedPane modeTabs;
 
@@ -68,22 +83,29 @@ public final class NexusSearchPanel extends JPanel {
     private final JTextField classNameField;
     private final JCheckBox fullyQualifiedCheckBox;
 
-    // Common controls
-    private final JSpinner pageSpinner;
-    private final JButton searchButton;
-    private final JButton cancelButton;
+    // Controls
+    private JButton searchButton;
+    private JButton cancelButton;
     private final JProgressBar progressBar;
 
-    private final JTable resultTable;
+    private final JXTable resultTable;
     private final ResultTableModel tableModel;
 
-    private SearchWorker currentWorker;
+    private final JTabbedPane snippetTabs;
+    private final RSyntaxTextArea mavenArea;
+    private final RSyntaxTextArea gradleArea;
+    private final RSyntaxTextArea ivyArea;
+    private final RSyntaxTextArea sbtArea;
+    private final RSyntaxTextArea leinArea;
+    private final RSyntaxTextArea grapeArea;
+    private final RSyntaxTextArea buildrArea;
+    private final RSyntaxTextArea bldArea;
 
-    public NexusSearchPanel(NexusSearch search) {
+    private transient SearchWorker currentWorker;
+
+    public NexusSearchPanel(API api) {
         super(new BorderLayout());
-        this.search = Objects.requireNonNull(search, "search must not be null");
 
-        // Top: query controls in a tabbed pane
         modeTabs = new JTabbedPane();
 
         keywordField = new JTextField(30);
@@ -99,6 +121,9 @@ public final class NexusSearchPanel extends JPanel {
         modeTabs.addTab("Coordinates", createGavPanel());
         modeTabs.addTab("Class", createClassPanel());
 
+        ProxyConfig proxyConfig = ProxyConfigHelper.fromPreferences(api.getPreferences(), this);
+        NexusConfig nexusConfig = NexusConfigHelper.fromPreferences(api.getPreferences(), this);
+        search = NexusSearchFactory.create(nexusConfig, proxyConfig);
         if (!search.supportsClassSearch()) {
             modeTabs.setEnabledAt(3, false);
             modeTabs.setToolTipTextAt(3, "Class search is not supported by this backend");
@@ -108,21 +133,77 @@ public final class NexusSearchPanel extends JPanel {
         north.add(modeTabs, BorderLayout.CENTER);
         north.add(createControlStrip(), BorderLayout.SOUTH);
 
-        // Center: table with results
         tableModel = new ResultTableModel();
-        resultTable = new JTable(tableModel);
+        resultTable = new JXTable(tableModel);
         resultTable.setFillsViewportHeight(true);
+        resultTable.setColumnControlVisible(true);
+        resultTable.setHighlighters(HighlighterFactory.createSimpleStriping());
+        TableRowFilterSupport.forTable(resultTable)
+                .actions(true)
+                .searchable(true)
+                .checkListRenderer(new CheckListRenderer())
+                .apply();
 
-        JScrollPane scrollPane = new JScrollPane(resultTable);
+        resultTable.getSelectionModel().addListSelectionListener(new ListSelectionListener() {
+            @Override
+            public void valueChanged(ListSelectionEvent e) {
+                if (e.getValueIsAdjusting()) {
+                    return;
+                }
+                int viewRow = resultTable.getSelectedRow();
+                if (viewRow >= 0) {
+                    int modelRow = resultTable.convertRowIndexToModel(viewRow);
+                    NexusArtifact artifact = tableModel.getArtifactAt(modelRow);
+                    updateSnippets(artifact);
+                } else {
+                    updateSnippets(null);
+                }
+            }
+        });
+
+        JScrollPane tableScrollPane = new JScrollPane(resultTable);
+
+        snippetTabs = new JTabbedPane();
+        mavenArea = createReadOnlyEditor();
+        gradleArea = createReadOnlyEditor();
+        ivyArea = createReadOnlyEditor();
+        sbtArea = createReadOnlyEditor();
+        leinArea = createReadOnlyEditor();
+        grapeArea = createReadOnlyEditor();
+        buildrArea = createReadOnlyEditor();
+        bldArea = createReadOnlyEditor();
+
+        snippetTabs.addTab("Maven", new RTextScrollPane(mavenArea));
+        snippetTabs.addTab("Gradle", new RTextScrollPane(gradleArea));
+        snippetTabs.addTab("Ivy", new RTextScrollPane(ivyArea));
+        snippetTabs.addTab("SBT", new RTextScrollPane(sbtArea));
+        snippetTabs.addTab("Leiningen", new RTextScrollPane(leinArea));
+        snippetTabs.addTab("Grape", new RTextScrollPane(grapeArea));
+        snippetTabs.addTab("Buildr", new RTextScrollPane(buildrArea));
+        snippetTabs.addTab("bld", new RTextScrollPane(bldArea));
+
+        javax.swing.JSplitPane splitPane = new javax.swing.JSplitPane(
+                javax.swing.JSplitPane.VERTICAL_SPLIT,
+                tableScrollPane,
+                snippetTabs
+        );
+        splitPane.setResizeWeight(0.7);
 
         add(north, BorderLayout.NORTH);
-        add(scrollPane, BorderLayout.CENTER);
+        add(splitPane, BorderLayout.CENTER);
 
         progressBar = new JProgressBar(0, 100);
         progressBar.setStringPainted(true);
         progressBar.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
 
         add(progressBar, BorderLayout.SOUTH);
+    }
+
+    private static RSyntaxTextArea createReadOnlyEditor() {
+        RSyntaxTextArea area = new RSyntaxTextArea();
+        area.setEditable(false);
+        area.setCodeFoldingEnabled(false);
+        return area;
     }
 
     private JPanel createKeywordPanel() {
@@ -237,8 +318,6 @@ public final class NexusSearchPanel extends JPanel {
         JPanel panel = new JPanel(new GridBagLayout());
         panel.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4));
 
-        pageSpinner = new JSpinner(new SpinnerNumberModel(0, 0, Integer.MAX_VALUE, 1));
-
         searchButton = new JButton("Search");
         cancelButton = new JButton("Cancel");
         cancelButton.setEnabled(false);
@@ -252,18 +331,9 @@ public final class NexusSearchPanel extends JPanel {
 
         gbc.gridx = 0;
         gbc.anchor = GridBagConstraints.WEST;
-        panel.add(new JLabel("Page:"), gbc);
-
-        gbc.gridx = 1;
-        panel.add(pageSpinner, gbc);
-
-        gbc.gridx = 2;
-        gbc.weightx = 1.0;
-        gbc.anchor = GridBagConstraints.EAST;
         panel.add(searchButton, gbc);
 
-        gbc.gridx = 3;
-        gbc.weightx = 0.0;
+        gbc.gridx = 1;
         panel.add(cancelButton, gbc);
 
         return panel;
@@ -275,7 +345,6 @@ public final class NexusSearchPanel extends JPanel {
         }
 
         int mode = modeTabs.getSelectedIndex();
-        int pageNo = (Integer) pageSpinner.getValue();
 
         String keyword = null;
         String sha1 = null;
@@ -305,13 +374,15 @@ public final class NexusSearchPanel extends JPanel {
             }
         }
 
-        SearchRequest request = new SearchRequest(mode, pageNo, keyword, sha1, groupId, artifactId, version, className, fullyQualified);
+        SearchRequest request = new SearchRequest(mode, keyword, sha1, groupId, artifactId, version, className, fullyQualified);
 
         currentWorker = new SearchWorker(this, search, request);
         currentWorker.execute();
 
         searchButton.setEnabled(false);
         cancelButton.setEnabled(true);
+        progressBar.setValue(0);
+        progressBar.setString("Starting...");
     }
 
     private void cancelSearch() {
@@ -331,15 +402,25 @@ public final class NexusSearchPanel extends JPanel {
                     error.getClass().getSimpleName() + ": " + error.getMessage(),
                     "Search error",
                     JOptionPane.ERROR_MESSAGE);
+            tableModel.setArtifacts(List.of());
+            updateSnippets(null);
             return;
         }
 
-        if (result == null) {
+        if (result == null || result.artifacts() == null) {
             tableModel.setArtifacts(List.of());
+            updateSnippets(null);
             return;
         }
 
         tableModel.setArtifacts(result.artifacts());
+
+        if (!result.artifacts().isEmpty()) {
+            resultTable.getSelectionModel().setSelectionInterval(0, 0);
+            updateSnippets(result.artifacts().get(0));
+        } else {
+            updateSnippets(null);
+        }
     }
 
     /**
@@ -347,7 +428,6 @@ public final class NexusSearchPanel extends JPanel {
      */
     private record SearchRequest(
             int mode,
-            int pageNo,
             String keyword,
             String sha1,
             String groupId,
@@ -359,8 +439,9 @@ public final class NexusSearchPanel extends JPanel {
 
     /**
      * We encapsulate the background search logic in a SwingWorker.
-     * We use the progress property to drive a ProgressMonitor and the
-     * embedded progress bar.
+     * We page through results until there are no more results, a maximum
+     * page count is reached, or the user cancels. SHA-1 search is treated
+     * as a single page operation.
      */
     private static final class SearchWorker extends SwingWorker<NexusSearchResult, Void> implements PropertyChangeListener {
 
@@ -391,30 +472,54 @@ public final class NexusSearchPanel extends JPanel {
                     return null;
                 }
 
-                NexusSearchResult result;
-                setProgress(25);
-                monitor.setNote("Executing query");
-
-                if (isCancelled()) {
-                    return null;
+                // SHA-1: we perform a single request and do not page
+                if (request.mode() == 1) {
+                    setProgress(25);
+                    monitor.setNote("Executing SHA-1 query");
+                    if (isCancelled()) {
+                        return null;
+                    }
+                    NexusSearchResult single = search.searchBySha1(request.sha1(), 0);
+                    setProgress(90);
+                    monitor.setNote("Processing results");
+                    return single;
                 }
 
-                switch (request.mode()) {
-                    case 0 -> result = search.searchByKeyword(request.keyword(), request.pageNo());
-                    case 1 -> result = search.searchBySha1(request.sha1(), request.pageNo());
-                    case 2 -> result = search.searchByGav(request.groupId(), request.artifactId(), request.version(), request.pageNo());
-                    case 3 -> result = search.searchByClassName(request.className(), request.fullyQualified(), request.pageNo());
-                    default -> result = null;
+                List<NexusArtifact> allArtifacts = new ArrayList<>();
+                for (int page = 0; page < MAX_PAGES && !isCancelled(); page++) {
+                    int baseProgress = 10;
+                    int pageRange = 80;
+                    int pageProgress = baseProgress + (pageRange * page) / MAX_PAGES;
+                    setProgress(pageProgress);
+                    monitor.setNote("Loading page " + (page + 1));
+
+                    NexusSearchResult pageResult;
+                    switch (request.mode()) {
+                        case 0 -> pageResult = search.searchByKeyword(request.keyword(), page);
+                        case 2 -> pageResult = search.searchByGav(request.groupId(), request.artifactId(), request.version(), page);
+                        case 3 -> pageResult = search.searchByClassName(request.className(), request.fullyQualified(), page);
+                        default -> pageResult = null;
+                    }
+
+                    if (pageResult == null || pageResult.artifacts() == null || pageResult.artifacts().isEmpty()) {
+                        break;
+                    }
+
+                    allArtifacts.addAll(pageResult.artifacts());
+
+                    if (monitor.isCanceled()) {
+                        cancel(true);
+                        break;
+                    }
                 }
 
                 setProgress(90);
                 monitor.setNote("Processing results");
-
                 if (isCancelled()) {
                     return null;
                 }
 
-                return result;
+                return new NexusSearchResult(allArtifacts);
             } catch (Throwable t) {
                 this.error = t;
                 return null;
@@ -453,6 +558,8 @@ public final class NexusSearchPanel extends JPanel {
      */
     private static final class ResultTableModel extends AbstractTableModel {
 
+        private static final long serialVersionUID = 1L;
+
         private static final String[] COLUMN_NAMES = {
                 "Group",
                 "Artifact",
@@ -460,8 +567,7 @@ public final class NexusSearchPanel extends JPanel {
                 "Date",
                 "Classifier",
                 "Extension",
-                "Repository",
-                "Artifact link"
+                "Repository"
         };
 
         private final List<NexusArtifact> artifacts = new ArrayList<>();
@@ -472,6 +578,13 @@ public final class NexusSearchPanel extends JPanel {
                 artifacts.addAll(newArtifacts);
             }
             fireTableDataChanged();
+        }
+
+        public NexusArtifact getArtifactAt(int rowIndex) {
+            if (rowIndex < 0 || rowIndex >= artifacts.size()) {
+                return null;
+            }
+            return artifacts.get(rowIndex);
         }
 
         @Override
@@ -503,7 +616,6 @@ public final class NexusSearchPanel extends JPanel {
                 case 4 -> a.classifier();
                 case 5 -> a.extension();
                 case 6 -> a.repository();
-                case 7 -> a.artifactLink();
                 default -> "";
             };
         }
@@ -514,43 +626,139 @@ public final class NexusSearchPanel extends JPanel {
         }
     }
 
-    /**
-     * We provide a minimal frame wrapper for manual testing.
-     * In a real application we would inject a concrete NexusSearch
-     * implementation such as SolrCentralSearchClient or
-     * SonatypeCentralSearchClient or a NexusV2Client or NexusV3Client
-     * created from configuration.
-     */
-    public static final class NexusSearchFrame extends JFrame {
-
-        public NexusSearchFrame(NexusSearch search) {
-            super("Nexus search");
-            setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
-            setContentPane(new NexusSearchPanel(search));
-            pack();
-            setLocationRelativeTo(null);
+    private void updateSnippets(NexusArtifact artifact) {
+        if (artifact == null) {
+            mavenArea.setText("");
+            gradleArea.setText("");
+            ivyArea.setText("");
+            sbtArea.setText("");
+            leinArea.setText("");
+            grapeArea.setText("");
+            buildrArea.setText("");
+            bldArea.setText("");
+            return;
         }
 
-        public static void showWith(NexusSearch search) {
-            SwingUtilities.invokeLater(() -> {
-                JFrame frame = new NexusSearchFrame(search);
-                frame.setVisible(true);
-            });
-        }
+        String g = artifact.groupId();
+        String a = artifact.artifactId();
+        String v = artifact.version();
+        String c = artifact.classifier();
+        String p = artifact.extension();
+
+        mavenArea.setText(buildMavenSnippet(g, a, v, c, p));
+        gradleArea.setText(buildGradleSnippet(g, a, v, c, p));
+        ivyArea.setText(buildIvySnippet(g, a, v, c, p));
+        sbtArea.setText(buildSbtSnippet(g, a, v, c, p));
+        leinArea.setText(buildLeinSnippet(g, a, v, c, p));
+        grapeArea.setText(buildGrapeSnippet(g, a, v, c, p));
+        buildrArea.setText(buildBuildrSnippet(g, a, v, c, p));
+        bldArea.setText(buildBldSnippet(g, a, v, c, p));
     }
 
-    /**
-     * Convenience for manual execution.
-     * Replace the placeholder construction by an actual NexusSearch implementation.
-     */
-    public static void main(String[] args) {
-        // Example placeholder, to be replaced with a concrete implementation in our environment:
-        // NexusSearch search = new SolrCentralSearchClient(null);
-        // NexusSearchFrame.showWith(search);
+    private static String buildMavenSnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<dependency>\n");
+        sb.append("  <groupId>").append(g).append("</groupId>\n");
+        sb.append("  <artifactId>").append(a).append("</artifactId>\n");
+        sb.append("  <version>").append(v).append("</version>\n");
+        if (c != null && !c.isBlank()) {
+            sb.append("  <classifier>").append(c).append("</classifier>\n");
+        }
+        if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
+            sb.append("  <type>").append(p).append("</type>\n");
+        }
+        sb.append("</dependency>\n");
+        return sb.toString();
+    }
 
-        JOptionPane.showMessageDialog(null,
-                "Please wire an actual NexusSearch implementation in main() before running this class.",
-                "NexusSearchPanel demo",
-                JOptionPane.INFORMATION_MESSAGE);
+    private static String buildGradleSnippet(String g, String a, String v, String c, String p) {
+        String coords;
+        if (c != null && !c.isBlank()) {
+            if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
+                coords = g + ":" + a + ":" + v + ":" + c + "@" + p;
+            } else {
+                coords = g + ":" + a + ":" + v + ":" + c;
+            }
+        } else {
+            coords = g + ":" + a + ":" + v;
+        }
+        return "dependencies {\n    implementation \"" + coords + "\"\n}\n";
+    }
+
+    private static String buildIvySnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<dependency org=\"").append(g)
+                .append("\" name=\"").append(a)
+                .append("\" rev=\"").append(v).append("\"");
+        if (p != null && !p.isBlank()) {
+            sb.append(" type=\"").append(p).append("\"");
+        }
+        if (c != null && !c.isBlank()) {
+            sb.append(" classifier=\"").append(c).append("\"");
+        }
+        sb.append(" />\n");
+        return sb.toString();
+    }
+
+    private static String buildSbtSnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("libraryDependencies += \"").append(g).append("\" % \"").append(a).append("\" % \"").append(v).append("\"");
+        if (c != null && !c.isBlank()) {
+            sb.append(" classifier \"").append(c).append("\"");
+        }
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    private static String buildLeinSnippet(String g, String a, String v, String c, String p) {
+        String ga = g + "/" + a;
+        StringBuilder sb = new StringBuilder();
+        sb.append("[\"").append(ga).append("\" \"").append(v).append("\"");
+        if (c != null && !c.isBlank()) {
+            sb.append(" :classifier \"").append(c).append("\"");
+        }
+        if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
+            sb.append(" :extension \"").append(p).append("\"");
+        }
+        sb.append("]\n");
+        return sb.toString();
+    }
+
+    private static String buildGrapeSnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("@Grapes(\n");
+        sb.append("    @Grab(group='").append(g).append("', module='").append(a).append("', version='").append(v).append("'");
+        if (c != null && !c.isBlank()) {
+            sb.append(", classifier='").append(c).append("'");
+        }
+        if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
+            sb.append(", type='").append(p).append("'");
+        }
+        sb.append(")\n)\n");
+        return sb.toString();
+    }
+
+    private static String buildBuildrSnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        String packaging = (p == null || p.isBlank()) ? "jar" : p;
+        sb.append("compile '").append(g).append(":").append(a).append(":").append(packaging).append(":").append(v);
+        if (c != null && !c.isBlank()) {
+            sb.append(":").append(c);
+        }
+        sb.append("'\n");
+        return sb.toString();
+    }
+
+    private static String buildBldSnippet(String g, String a, String v, String c, String p) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("dependency(\"").append(g).append("\", \"").append(a).append("\", \"").append(v).append("\"");
+        if (c != null && !c.isBlank()) {
+            sb.append(", classifier=\"").append(c).append("\"");
+        }
+        if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
+            sb.append(", type=\"").append(p).append("\"");
+        }
+        sb.append(");\n");
+        return sb.toString();
     }
 }
