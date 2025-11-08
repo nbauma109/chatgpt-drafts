@@ -6,6 +6,8 @@ import org.fife.ui.rtextarea.RTextScrollPane;
 import org.jd.gui.api.API;
 import org.jd.gui.util.NexusConfigHelper;
 import org.jd.gui.util.ProxyConfigHelper;
+import org.jd.gui.util.ThemeUtil;
+import org.jd.gui.util.maven.central.helper.ProxyConfig;
 import org.jd.gui.util.nexus.NexusConfig;
 import org.jd.gui.util.nexus.NexusSearch;
 import org.jd.gui.util.nexus.NexusSearchFactory;
@@ -21,10 +23,12 @@ import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
+import javax.swing.JMenuItem;
 import javax.swing.SwingWorker;
 import javax.swing.event.ListSelectionEvent;
 import javax.swing.event.ListSelectionListener;
@@ -33,8 +37,11 @@ import java.awt.BorderLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
+import java.net.URI;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
@@ -52,7 +59,10 @@ import java.util.List;
  * through a single JProgressBar at the bottom. Results are displayed
  * in a table backed by a custom table model and are appended as pages
  * arrive. Snippets for several build tools are shown in RSyntaxTextArea
- * tabs for the selected row.
+ * tabs for the selected row. A double click on a row opens the artifact
+ * link in the main JD-GUI window via API.openURI. A right click on the
+ * table shows a context menu with a Compare Files action when exactly
+ * two rows are selected, which calls API.compareFiles.
  */
 public final class NexusSearchPanel extends JPanel {
 
@@ -60,6 +70,7 @@ public final class NexusSearchPanel extends JPanel {
 
     private static final int MAX_PAGES = 50;
 
+    private final transient API api;
     private final transient NexusSearch search;
 
     private final JTabbedPane modeTabs;
@@ -96,10 +107,14 @@ public final class NexusSearchPanel extends JPanel {
     private final RSyntaxTextArea buildrArea;
     private final RSyntaxTextArea bldArea;
 
+    private final JPopupMenu tablePopupMenu;
+    private final JMenuItem compareFilesItem;
+
     private transient SearchWorker currentWorker;
 
     public NexusSearchPanel(API api) {
         super(new BorderLayout());
+        this.api = api;
 
         modeTabs = new JTabbedPane();
 
@@ -155,6 +170,76 @@ public final class NexusSearchPanel extends JPanel {
             }
         });
 
+        tablePopupMenu = new JPopupMenu();
+        compareFilesItem = new JMenuItem("Compare Files");
+        compareFilesItem.addActionListener(e -> compareSelectedArtifacts());
+        tablePopupMenu.add(compareFilesItem);
+
+        resultTable.addMouseListener(new MouseAdapter() {
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2 && !e.isConsumed()) {
+                    e.consume();
+                    int viewRow = resultTable.rowAtPoint(e.getPoint());
+                    if (viewRow < 0) {
+                        return;
+                    }
+                    int modelRow = resultTable.convertRowIndexToModel(viewRow);
+                    NexusArtifact artifact = tableModel.getArtifactAt(modelRow);
+                    if (artifact == null) {
+                        return;
+                    }
+                    String link = artifact.artifactLink();
+                    if (link == null || link.isBlank()) {
+                        JOptionPane.showMessageDialog(
+                                NexusSearchPanel.this,
+                                "No download link is available for this artifact.",
+                                "No link",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                        return;
+                    }
+                    try {
+                        api.openURI(URI.create(link));
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(
+                                NexusSearchPanel.this,
+                                "Cannot open link:\n" + ex.getMessage(),
+                                "Open error",
+                                JOptionPane.ERROR_MESSAGE
+                        );
+                    }
+                }
+            }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                handlePopup(e);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                handlePopup(e);
+            }
+
+            private void handlePopup(MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    return;
+                }
+                int row = resultTable.rowAtPoint(e.getPoint());
+                if (row >= 0) {
+                    if (!resultTable.getSelectionModel().isSelectedIndex(row)) {
+                        resultTable.getSelectionModel().setSelectionInterval(row, row);
+                    }
+                }
+                int[] selected = resultTable.getSelectedRows();
+                if (selected.length == 2) {
+                    tablePopupMenu.show(resultTable, e.getX(), e.getY());
+                }
+            }
+        });
+
         JScrollPane tableScrollPane = new JScrollPane(resultTable);
 
         snippetTabs = new JTabbedPane();
@@ -197,7 +282,6 @@ public final class NexusSearchPanel extends JPanel {
         RSyntaxTextArea area = new RSyntaxTextArea();
         area.setEditable(false);
         area.setCodeFoldingEnabled(false);
-        // We apply the current JD-GUI theme and configure syntax highlighting.
         ThemeUtil.applyTheme(api, area);
         area.setSyntaxEditingStyle(syntaxStyle);
         return area;
@@ -627,6 +711,44 @@ public final class NexusSearchPanel extends JPanel {
         grapeArea.setText(buildGrapeSnippet(g, a, v, c, p));
         buildrArea.setText(buildBuildrSnippet(g, a, v, c, p));
         bldArea.setText(buildBldSnippet(g, a, v, c, p));
+    }
+
+    private void compareSelectedArtifacts() {
+        int[] selected = resultTable.getSelectedRows();
+        if (selected == null || selected.length != 2) {
+            return;
+        }
+        int modelRow1 = resultTable.convertRowIndexToModel(selected[0]);
+        int modelRow2 = resultTable.convertRowIndexToModel(selected[1]);
+
+        NexusArtifact a1 = tableModel.getArtifactAt(modelRow1);
+        NexusArtifact a2 = tableModel.getArtifactAt(modelRow2);
+        if (a1 == null || a2 == null) {
+            return;
+        }
+
+        String link1 = a1.artifactLink();
+        String link2 = a2.artifactLink();
+        if (link1 == null || link1.isBlank() || link2 == null || link2.isBlank()) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "Both selected artifacts must have a download link in order to compare files.",
+                    "Cannot compare",
+                    JOptionPane.WARNING_MESSAGE
+            );
+            return;
+        }
+
+        try {
+            api.compareFiles(URI.create(link1), URI.create(link2));
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "Cannot compare files:\n" + ex.getMessage(),
+                    "Compare error",
+                    JOptionPane.ERROR_MESSAGE
+            );
+        }
     }
 
     private static String buildMavenSnippet(String g, String a, String v, String c, String p) {
