@@ -1,27 +1,23 @@
 package org.jd.gui.util.maven.central.helper;
 
+import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
+import org.fife.ui.rsyntaxtextarea.SyntaxConstants;
+import org.fife.ui.rtextarea.RTextScrollPane;
 import org.jd.gui.api.API;
 import org.jd.gui.util.NexusConfigHelper;
 import org.jd.gui.util.ProxyConfigHelper;
-import org.jd.gui.util.maven.central.helper.model.response.docs.Docs;
 import org.jd.gui.util.nexus.NexusConfig;
 import org.jd.gui.util.nexus.NexusSearch;
 import org.jd.gui.util.nexus.NexusSearchFactory;
 import org.jd.gui.util.nexus.model.NexusArtifact;
 import org.jd.gui.util.nexus.model.NexusSearchResult;
-import org.jd.gui.util.maven.central.helper.model.response.Response;
-import org.jd.gui.util.maven.central.helper.model.ResponseRoot;
-import org.jd.gui.util.maven.central.helper.ProxyConfig;
 import org.jdesktop.swingx.JXTable;
 import org.jdesktop.swingx.decorator.HighlighterFactory;
 import org.oxbow.swingbits.list.CheckListRenderer;
 import org.oxbow.swingbits.table.filter.TableRowFilterSupport;
-import org.fife.ui.rsyntaxtextarea.RSyntaxTextArea;
-import org.fife.ui.rtextarea.RTextScrollPane;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
-import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -29,7 +25,6 @@ import javax.swing.JProgressBar;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
-import javax.swing.ProgressMonitor;
 import javax.swing.SwingWorker;
 import javax.swing.event.ListSelectionEvent;
 import javax.swing.event.ListSelectionListener;
@@ -51,12 +46,13 @@ import java.util.List;
  *  - Keyword search
  *  - SHA-1 search
  *  - Group, artifact, version search
- *  - Class name search (simple or fully qualified)
+ *  - Class name search (simple or fully qualified, inferred from the presence of a dot)
  *
  * We execute searches in a background SwingWorker and report progress
- * through a ProgressMonitor and a progress bar. Results are displayed
- * in a table backed by a custom table model. Snippets for several build
- * tools are shown for the selected row in RSyntaxTextArea tabs.
+ * through a single JProgressBar at the bottom. Results are displayed
+ * in a table backed by a custom table model and are appended as pages
+ * arrive. Snippets for several build tools are shown in RSyntaxTextArea
+ * tabs for the selected row.
  */
 public final class NexusSearchPanel extends JPanel {
 
@@ -81,7 +77,6 @@ public final class NexusSearchPanel extends JPanel {
 
     // Class tab
     private final JTextField classNameField;
-    private final JCheckBox fullyQualifiedCheckBox;
 
     // Controls
     private JButton searchButton;
@@ -114,7 +109,6 @@ public final class NexusSearchPanel extends JPanel {
         artifactField = new JTextField(20);
         versionField = new JTextField(12);
         classNameField = new JTextField(30);
-        fullyQualifiedCheckBox = new JCheckBox("Fully qualified");
 
         modeTabs.addTab("Keyword", createKeywordPanel());
         modeTabs.addTab("SHA-1", createSha1Panel());
@@ -164,14 +158,14 @@ public final class NexusSearchPanel extends JPanel {
         JScrollPane tableScrollPane = new JScrollPane(resultTable);
 
         snippetTabs = new JTabbedPane();
-        mavenArea = createReadOnlyEditor();
-        gradleArea = createReadOnlyEditor();
-        ivyArea = createReadOnlyEditor();
-        sbtArea = createReadOnlyEditor();
-        leinArea = createReadOnlyEditor();
-        grapeArea = createReadOnlyEditor();
-        buildrArea = createReadOnlyEditor();
-        bldArea = createReadOnlyEditor();
+        mavenArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_XML);
+        gradleArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_GROOVY);
+        ivyArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_XML);
+        sbtArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_SCALA);
+        leinArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_CLOJURE);
+        grapeArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_GROOVY);
+        buildrArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_RUBY);
+        bldArea = createReadOnlyEditor(api, SyntaxConstants.SYNTAX_STYLE_JAVA);
 
         snippetTabs.addTab("Maven", new RTextScrollPane(mavenArea));
         snippetTabs.addTab("Gradle", new RTextScrollPane(gradleArea));
@@ -199,10 +193,13 @@ public final class NexusSearchPanel extends JPanel {
         add(progressBar, BorderLayout.SOUTH);
     }
 
-    private static RSyntaxTextArea createReadOnlyEditor() {
+    private RSyntaxTextArea createReadOnlyEditor(API api, String syntaxStyle) {
         RSyntaxTextArea area = new RSyntaxTextArea();
         area.setEditable(false);
         area.setCodeFoldingEnabled(false);
+        // We apply the current JD-GUI theme and configure syntax highlighting.
+        ThemeUtil.applyTheme(api, area);
+        area.setSyntaxEditingStyle(syntaxStyle);
         return area;
     }
 
@@ -305,12 +302,6 @@ public final class NexusSearchPanel extends JPanel {
         gbc.fill = GridBagConstraints.HORIZONTAL;
         panel.add(classNameField, gbc);
 
-        gbc.gridx = 1;
-        gbc.gridy = 1;
-        gbc.weightx = 0.0;
-        gbc.fill = GridBagConstraints.NONE;
-        panel.add(fullyQualifiedCheckBox, gbc);
-
         return panel;
     }
 
@@ -352,7 +343,6 @@ public final class NexusSearchPanel extends JPanel {
         String artifactId = null;
         String version = null;
         String className = null;
-        boolean fullyQualified = false;
 
         switch (mode) {
             case 0 -> keyword = keywordField.getText().trim();
@@ -365,18 +355,19 @@ public final class NexusSearchPanel extends JPanel {
                     version = null;
                 }
             }
-            case 3 -> {
-                className = classNameField.getText().trim();
-                fullyQualified = fullyQualifiedCheckBox.isSelected();
-            }
+            case 3 -> className = classNameField.getText().trim();
             default -> {
                 return;
             }
         }
 
-        SearchRequest request = new SearchRequest(mode, keyword, sha1, groupId, artifactId, version, className, fullyQualified);
+        SearchRequest request = new SearchRequest(mode, keyword, sha1, groupId, artifactId, version, className);
+
+        tableModel.setArtifacts(List.of());
+        updateSnippets(null);
 
         currentWorker = new SearchWorker(this, search, request);
+        currentWorker.addPropertyChangeListener(currentWorker);
         currentWorker.execute();
 
         searchButton.setEnabled(false);
@@ -391,7 +382,7 @@ public final class NexusSearchPanel extends JPanel {
         }
     }
 
-    private void onSearchCompleted(NexusSearchResult result, Throwable error) {
+    private void onSearchCompleted(Throwable error) {
         searchButton.setEnabled(true);
         cancelButton.setEnabled(false);
         progressBar.setValue(0);
@@ -402,30 +393,16 @@ public final class NexusSearchPanel extends JPanel {
                     error.getClass().getSimpleName() + ": " + error.getMessage(),
                     "Search error",
                     JOptionPane.ERROR_MESSAGE);
-            tableModel.setArtifacts(List.of());
-            updateSnippets(null);
             return;
         }
 
-        if (result == null || result.artifacts() == null) {
-            tableModel.setArtifacts(List.of());
-            updateSnippets(null);
-            return;
-        }
-
-        tableModel.setArtifacts(result.artifacts());
-
-        if (!result.artifacts().isEmpty()) {
+        if (tableModel.getRowCount() > 0 && resultTable.getSelectedRow() < 0) {
             resultTable.getSelectionModel().setSelectionInterval(0, 0);
-            updateSnippets(result.artifacts().get(0));
-        } else {
-            updateSnippets(null);
+            NexusArtifact first = tableModel.getArtifactAt(0);
+            updateSnippets(first);
         }
     }
 
-    /**
-     * We represent an immutable search request snapshot.
-     */
     private record SearchRequest(
             int mode,
             String keyword,
@@ -433,129 +410,117 @@ public final class NexusSearchPanel extends JPanel {
             String groupId,
             String artifactId,
             String version,
-            String className,
-            boolean fullyQualified) {
+            String className) {
     }
 
-    /**
-     * We encapsulate the background search logic in a SwingWorker.
-     * We page through results until there are no more results, a maximum
-     * page count is reached, or the user cancels. SHA-1 search is treated
-     * as a single page operation.
-     */
-    private static final class SearchWorker extends SwingWorker<NexusSearchResult, Void> implements PropertyChangeListener {
+    private static final class SearchWorker extends SwingWorker<Void, List<NexusArtifact>> implements PropertyChangeListener {
 
         private final NexusSearchPanel panel;
         private final NexusSearch search;
         private final SearchRequest request;
 
-        private final ProgressMonitor monitor;
         private volatile Throwable error;
 
         SearchWorker(NexusSearchPanel panel, NexusSearch search, SearchRequest request) {
             this.panel = panel;
             this.search = search;
             this.request = request;
-            this.monitor = new ProgressMonitor(panel, "Searching remote repository", "", 0, 100);
-            this.monitor.setMillisToDecideToPopup(200);
-            this.monitor.setMillisToPopup(300);
-            addPropertyChangeListener(this);
         }
 
         @Override
-        protected NexusSearchResult doInBackground() {
+        protected Void doInBackground() {
             try {
                 setProgress(5);
-                monitor.setNote("Preparing request");
-                if (monitor.isCanceled()) {
-                    cancel(true);
-                    return null;
-                }
 
-                // SHA-1: we perform a single request and do not page
                 if (request.mode() == 1) {
-                    setProgress(25);
-                    monitor.setNote("Executing SHA-1 query");
                     if (isCancelled()) {
                         return null;
                     }
-                    NexusSearchResult single = search.searchBySha1(request.sha1(), 0);
-                    setProgress(90);
-                    monitor.setNote("Processing results");
-                    return single;
+                    setProgress(25);
+                    NexusSearchResult page = search.searchBySha1(request.sha1(), 0);
+                    if (!isCancelled() && page != null && page.artifacts() != null && !page.artifacts().isEmpty()) {
+                        publish(page.artifacts());
+                    }
+                    setProgress(100);
+                    return null;
                 }
 
-                List<NexusArtifact> allArtifacts = new ArrayList<>();
                 for (int page = 0; page < MAX_PAGES && !isCancelled(); page++) {
                     int baseProgress = 10;
                     int pageRange = 80;
                     int pageProgress = baseProgress + (pageRange * page) / MAX_PAGES;
                     setProgress(pageProgress);
-                    monitor.setNote("Loading page " + (page + 1));
+
+                    if (isCancelled()) {
+                        break;
+                    }
 
                     NexusSearchResult pageResult;
                     switch (request.mode()) {
                         case 0 -> pageResult = search.searchByKeyword(request.keyword(), page);
                         case 2 -> pageResult = search.searchByGav(request.groupId(), request.artifactId(), request.version(), page);
-                        case 3 -> pageResult = search.searchByClassName(request.className(), request.fullyQualified(), page);
+                        case 3 -> {
+                            boolean fullyQualified = request.className() != null && request.className().contains(".");
+                            pageResult = search.searchByClassName(request.className(), fullyQualified, page);
+                        }
                         default -> pageResult = null;
                     }
 
-                    if (pageResult == null || pageResult.artifacts() == null || pageResult.artifacts().isEmpty()) {
+                    if (pageResult == null || pageResult.artifacts() == null) {
                         break;
                     }
 
-                    allArtifacts.addAll(pageResult.artifacts());
-
-                    if (monitor.isCanceled()) {
-                        cancel(true);
+                    List<NexusArtifact> pageArtifacts = pageResult.artifacts();
+                    if (pageArtifacts.isEmpty()) {
                         break;
                     }
+
+                    publish(pageArtifacts);
                 }
 
-                setProgress(90);
-                monitor.setNote("Processing results");
-                if (isCancelled()) {
-                    return null;
-                }
-
-                return new NexusSearchResult(allArtifacts);
+                setProgress(100);
             } catch (Throwable t) {
                 this.error = t;
-                return null;
-            } finally {
-                setProgress(100);
+            }
+            return null;
+        }
+
+        @Override
+        protected void process(List<List<NexusArtifact>> chunks) {
+            for (List<NexusArtifact> chunk : chunks) {
+                if (chunk == null || chunk.isEmpty()) {
+                    continue;
+                }
+                boolean hadRowsBefore = panel.tableModel.getRowCount() > 0;
+                panel.tableModel.addArtifacts(chunk);
+
+                if (!hadRowsBefore && panel.tableModel.getRowCount() > 0) {
+                    panel.resultTable.getSelectionModel().setSelectionInterval(0, 0);
+                    NexusArtifact first = panel.tableModel.getArtifactAt(0);
+                    panel.updateSnippets(first);
+                }
             }
         }
 
         @Override
         protected void done() {
-            monitor.close();
-            try {
-                NexusSearchResult result = isCancelled() ? null : get();
-                panel.onSearchCompleted(result, error);
-            } catch (Exception ex) {
-                panel.onSearchCompleted(null, error != null ? error : ex);
-            }
+            panel.onSearchCompleted(error);
         }
 
         @Override
         public void propertyChange(PropertyChangeEvent evt) {
             if ("progress".equals(evt.getPropertyName())) {
                 int value = (Integer) evt.getNewValue();
-                monitor.setProgress(value);
                 panel.progressBar.setValue(value);
-                panel.progressBar.setString(value + " %");
-                if (monitor.isCanceled()) {
-                    cancel(true);
+                if (value > 0 && value < 100) {
+                    panel.progressBar.setString(value + " %");
+                } else {
+                    panel.progressBar.setString("");
                 }
             }
         }
     }
 
-    /**
-     * We provide a table model that exposes NexusArtifact properties in columns.
-     */
     private static final class ResultTableModel extends AbstractTableModel {
 
         private static final long serialVersionUID = 1L;
@@ -578,6 +543,15 @@ public final class NexusSearchPanel extends JPanel {
                 artifacts.addAll(newArtifacts);
             }
             fireTableDataChanged();
+        }
+
+        public void addArtifacts(List<NexusArtifact> newArtifacts) {
+            if (newArtifacts == null || newArtifacts.isEmpty()) {
+                return;
+            }
+            int first = artifacts.size();
+            artifacts.addAll(newArtifacts);
+            fireTableRowsInserted(first, artifacts.size() - 1);
         }
 
         public NexusArtifact getArtifactAt(int rowIndex) {
@@ -734,7 +708,8 @@ public final class NexusSearchPanel extends JPanel {
         if (p != null && !p.isBlank() && !"jar".equalsIgnoreCase(p)) {
             sb.append(", type='").append(p).append("'");
         }
-        sb.append(")\n)\n");
+        sb.append(")\n");
+        sb.append(")\n");
         return sb.toString();
     }
 
